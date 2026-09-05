@@ -183,6 +183,42 @@ SL_TC_WAV=/path/to/tone.wav cargo test --features "synth wav" -- --ignored
 * **Offline only.** Real-time audio-device input (cpal) is out of scope for now;
   the core is a streaming block-processor, so it can be added later.
 
+## Provenance & sources
+
+This crate is **clean-room** and MIT-licensed, which is only defensible if its
+provenance is clean. Concretely:
+
+* **The format model came from public conceptual descriptions.** The general
+  idea of a DVS control tone — a ~1 kHz quadrature sine carrier, one
+  amplitude-modulated bit per carrier cycle, and a maximal-length LFSR whose
+  sliding bit window yields absolute position — is publicly described and is not
+  owned by any single implementation. That model is the *only* thing taken from
+  external descriptions.
+* **Every concrete parameter was measured, not copied.** All constants — carrier
+  frequency, the quadrature lead channel, the two per-side 20-bit polynomials,
+  and the calibrated seeds — were *recovered from real Serato CV02 recordings* by
+  this crate's own analysis code (Berlekamp–Massey + FFT + calibration; see
+  `examples/analyze.rs`, `confirm.rs`, `calibrate.rs` and `NOTE.md`). They are
+  facts about the pressed vinyl, derived independently, not lifted from another
+  program's source.
+* **No code was taken from any GPL decoder — including [xwax] and [Mixxx].** Both
+  are GPL-licensed (Mixxx's vinyl-control decoder is itself derived from xwax),
+  and neither was copied, referenced for constants, or otherwise incorporated.
+  This project and those share only the *format* being decoded — an
+  interface/compatibility relationship, not a derived-work one. Decoding the same
+  publicly-described signal is not a derivative work.
+
+[xwax]: https://xwax.org/
+[Mixxx]: https://mixxx.org/
+
+## Disclaimer
+
+This project is an independent, clean-room effort and is **not affiliated with,
+endorsed, or sponsored by Serato, inMusic Brands, or any related party**.
+"Serato", "Scratch Live", and any other trademarks are the property of their
+respective owners; they are used here only for identification and descriptive
+purposes.
+
 ## License
 
 MIT
