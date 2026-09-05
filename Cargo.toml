@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 license = "MIT"
 description = "Clean-room decoder for DVS (Serato-style) control-tone timecode"
-repository = ""
+repository = "https://github.com/smallanimal2000/sl-timecode-decoder.git"
 keywords = ["dvs", "timecode", "serato", "vinyl", "dsp"]
 categories = ["multimedia::audio"]
 
