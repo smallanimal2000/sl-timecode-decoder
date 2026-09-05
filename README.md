@@ -77,6 +77,34 @@ for smooth scrubbing between the ~1 kHz bit resolution. Tuning is exposed via
 `DecoderConfig` / `SlicerConfig` (`Decoder::with_config`); the defaults are
 validated against the real recordings and the stress suite.
 
+### Side detection
+
+The two sides carry identical carriers and differ only in their LFSR polynomial,
+so the side can't be read off level, pitch, or direction — only from *which*
+polynomial the bit stream follows. The decoder tracks **both** sides against the
+same bit window and reports the winner on `DecodeState::side` (and `dec.side()`),
+so a plain decoder auto-detects the side with no extra setup:
+
+```rust
+use sl_timecode_decoder::{Decoder, Side, format};
+
+let mut dec = Decoder::new(format::serato_cv02(), 44_100.0);
+for state in dec.process(&stereo_frames) {
+    match state.side {
+        Some(Side::A) => { /* side A */ }
+        Some(Side::B) => { /* side B */ }
+        None => { /* not resolved yet */ }
+    }
+}
+```
+
+Detection keys on the **sustained agreement rate** between each side's lookups
+and its own predicted position: the correct polynomial agrees essentially every
+cycle, while the wrong one — kept re-syncing to its own bogus lookups — only
+agrees about half the time. Averaging over cycles separates the two cleanly. The
+side latches on the first confident resolution and then persists through
+dropouts.
+
 ## Examples
 
 ```sh
@@ -95,6 +123,9 @@ cargo run --example confirm --features "analysis wav synth" -- side.wav [skip_s]
 
 # Calibrate the absolute-position origin (seed) from a start-to-end recording:
 cargo run --example calibrate --features "analysis wav synth" -- side-a.wav side-b.wav
+
+# Auto-detect which side (A/B) a recording is, from the audio alone (no filename):
+cargo run --release --example detect --features wav -- side.wav
 ```
 
 `analyze` prints the measured carrier frequency, the L/R quadrature offset, the

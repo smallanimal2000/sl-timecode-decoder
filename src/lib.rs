@@ -77,4 +77,4 @@ pub mod analysis;
 pub mod wav;
 
 pub use decoder::{DecodeState, Decoder, Direction};
-pub use format::TimecodeFormat;
+pub use format::{Side, TimecodeFormat};

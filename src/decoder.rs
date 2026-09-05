@@ -19,7 +19,7 @@ use alloc::vec::Vec;
 use core::f64::consts::PI;
 
 use crate::dsp::{Frontend, SlicerConfig};
-use crate::format::TimecodeFormat;
+use crate::format::{Side, TimecodeFormat};
 use crate::lfsr::{pack_state, PositionMap};
 
 #[cfg(not(feature = "std"))]
@@ -45,6 +45,14 @@ pub struct DecodeState {
     pub pitch: f32,
     /// Play direction.
     pub direction: Direction,
+    /// Which pressed side (A/B) is playing, or `None` until a side is resolved.
+    ///
+    /// The two Serato CV02 sides carry identical carriers and differ only in
+    /// their LFSR polynomial, so the side can't be read off level, pitch, or
+    /// direction — only from which polynomial the bit stream locks to. The
+    /// decoder tracks both sides against the same bit window and latches this to
+    /// the first one that achieves a lock; it then stays set through dropouts.
+    pub side: Option<Side>,
     /// Whether the decoder currently has a confident position lock.
     pub locked: bool,
     /// Slice confidence of the bit that produced this state, in `[0, 1]`.
@@ -93,18 +101,67 @@ impl Default for DecoderConfig {
     }
 }
 
+/// EMA smoothing factor for the per-side agreement rate (≈20-event window). Slow
+/// enough that the wrong side's ~0.5 rate has low variance, fast enough that the
+/// correct side's rate climbs well within the warm-up window.
+const SIDE_EMA_ALPHA: f32 = 0.05;
+/// Agreement-rate threshold to accept a side. The correct polynomial agrees
+/// ~deterministically (→1.0); the wrong one agrees ~50% of the time (see below),
+/// so 0.7 sits comfortably between the two populations.
+const SIDE_CONFIDENCE: f32 = 0.7;
+/// A challenger side must beat the incumbent's agreement rate by this margin to
+/// take over, so a marginal recording doesn't flip the reported side.
+const SIDE_SWITCH_MARGIN: f32 = 0.1;
+
+/// Per-side position tracker. The decoder runs one of these for each candidate
+/// Serato side against the *same* rolling bit window.
+///
+/// The side is identified by the **sustained agreement rate** between each side's
+/// lookup and the position predicted from its own previous fix. The correct
+/// polynomial agrees essentially every cycle (its lookups are genuinely
+/// continuous). The wrong polynomial does *not* stay near zero: after a few
+/// disagreements the tracker re-syncs to its own (wrong) lookup, and from there
+/// it agrees whenever the next sliced bit happens to match that polynomial's
+/// feedback parity — a coin flip — so its rate hovers around 0.5. Averaging over
+/// many cycles (`agree_ema`) separates the two cleanly, where any single
+/// lock-streak race would not (the wrong side hits a 6-in-a-row streak ~1/64 of
+/// the time).
+struct SideTrack {
+    side: Side,
+    map: PositionMap,
+    last_pos: Option<i64>,
+    lock_count: u32,
+    disagree_count: u32,
+    /// EMA of per-cycle agreement (lookup == predicted), the side discriminator.
+    agree_ema: f32,
+}
+
+impl SideTrack {
+    fn new(side: Side) -> Self {
+        let fmt = side.format();
+        SideTrack {
+            side,
+            map: PositionMap::build(fmt.lfsr, fmt.seed),
+            last_pos: None,
+            lock_count: 0,
+            disagree_count: 0,
+            agree_ema: 0.5, // neutral: neither side favoured until evidence arrives
+        }
+    }
+}
+
 pub struct Decoder {
     fmt: TimecodeFormat,
     frontend: Frontend,
-    map: PositionMap,
+    tracks: [SideTrack; 2],
+    /// Latched once a side achieves a lock; thereafter the reported side, and the
+    /// track that drives `position_bits` / `locked`.
+    selected: Option<usize>,
     window_bits: usize,
     period: i64,
     cfg: DecoderConfig,
 
     bits: VecDeque<u8>,
-    last_pos: Option<i64>,
-    lock_count: u32,
-    disagree_count: u32,
     warmup: u32,
 
     // sub-bit fine position: anchored to the last locked cycle, extrapolated by
@@ -122,20 +179,22 @@ impl Decoder {
 
     pub fn with_config(fmt: TimecodeFormat, sample_rate: f32, cfg: DecoderConfig) -> Self {
         let frontend = Frontend::with_config(&fmt, sample_rate, cfg.slicer);
-        let map = PositionMap::build(fmt.lfsr, fmt.seed);
         let window_bits = fmt.window_bits();
         let period = (1i64 << fmt.lfsr.bits) - 1;
+        // Discriminate both Serato sides against the shared bit window. The sides
+        // carry identical carriers/geometry (so one front-end serves both) and
+        // differ only in their LFSR polynomial, which is exactly what side
+        // detection keys on. `fmt` supplies the front-end and carrier (identical
+        // across sides); the per-side maps come from the measured constructors.
         Decoder {
             fmt,
             frontend,
-            map,
+            tracks: [SideTrack::new(Side::A), SideTrack::new(Side::B)],
+            selected: None,
             window_bits,
             period,
             cfg,
             bits: VecDeque::with_capacity(window_bits + 1),
-            last_pos: None,
-            lock_count: 0,
-            disagree_count: 0,
             warmup: 0,
             anchor_pos: 0,
             anchor_phase: 0.0,
@@ -208,15 +267,70 @@ impl Decoder {
         }
     }
 
+    /// The resolved playing [`Side`], or `None` until a side achieves a lock.
+    /// Latches on the first lock and persists through dropouts. Pure read; does
+    /// not advance any state.
     #[inline]
-    fn wrap(&self, v: i64) -> i64 {
-        ((v % self.period) + self.period) % self.period
+    pub fn side(&self) -> Option<Side> {
+        self.selected.map(|i| self.tracks[i].side)
     }
 
     #[inline]
     fn wrap_f(&self, v: f64) -> f64 {
         let p = self.period as f64;
         ((v % p) + p) % p
+    }
+
+    /// Advance one side's tracker for this cycle from its lookup result, applying
+    /// the same predict/agree/re-sync logic per side. Returns the track's resolved
+    /// newest position, or `None` if it has no fix yet.
+    fn advance_track(
+        track: &mut SideTrack,
+        looked: Option<i64>,
+        step: i64,
+        period: i64,
+        cfg: &DecoderConfig,
+    ) -> Option<i64> {
+        let predicted = track.last_pos.map(|p| wrap_i(p + step, period));
+        // Feed the side discriminator whenever a prediction exists to compare
+        // against (skip the first fix, which has nothing to agree with).
+        if let Some(p) = predicted {
+            let agree = if looked == Some(p) { 1.0 } else { 0.0 };
+            track.agree_ema += SIDE_EMA_ALPHA * (agree - track.agree_ema);
+        }
+        let pos = match (looked, predicted) {
+            (Some(l), Some(p)) => {
+                if l == p {
+                    track.lock_count = (track.lock_count + 1).min(cfg.lock_threshold * 2);
+                    track.disagree_count = 0;
+                    l
+                } else {
+                    // Bit error (or a real jump/scratch). Hold the prediction for
+                    // a few cycles, then trust the lookup and re-sync.
+                    track.lock_count = 0;
+                    track.disagree_count += 1;
+                    if track.disagree_count >= cfg.resync_after {
+                        track.disagree_count = 0;
+                        l
+                    } else {
+                        p
+                    }
+                }
+            }
+            (Some(l), None) => {
+                // First fix.
+                track.lock_count = 0;
+                l
+            }
+            (None, Some(p)) => {
+                // Unresolvable window (e.g. all-zero from silence); coast.
+                track.lock_count = 0;
+                p
+            }
+            (None, None) => return None,
+        };
+        track.last_pos = Some(pos);
+        Some(pos)
     }
 
     /// Feed one stereo frame; returns a [`DecodeState`] when a bit is resolved
@@ -235,13 +349,15 @@ impl Decoder {
 
         // Signal-presence gate: below the floor the input is noise (e.g. the
         // pre-onset lead-in), where bit slices are random and any lock would be
-        // spurious. Don't let noise accumulate toward a lock.
+        // spurious. Don't let noise accumulate toward a lock, on either side.
         let strong = ev.signal >= self.cfg.min_signal;
         if strong {
             self.warmup = (self.warmup + 1).min(self.cfg.warmup_bits);
         } else {
-            self.lock_count = 0;
             self.warmup = 0;
+            for t in &mut self.tracks {
+                t.lock_count = 0;
+            }
         }
 
         let pitch = ev.pitch;
@@ -260,10 +376,11 @@ impl Decoder {
         }
         if self.bits.len() < self.window_bits {
             return Some(DecodeState {
-                position_bits: self.last_pos.map(|p| p as f64).unwrap_or(f64::NAN),
+                position_bits: f64::NAN,
                 position_seconds: f64::NAN,
                 pitch,
                 direction,
+                side: self.side(),
                 locked: false,
                 confidence: ev.confidence,
                 signal: ev.signal,
@@ -272,99 +389,109 @@ impl Decoder {
             });
         }
 
-        // Pack the window into an LFSR state. Forward: oldest bit is the LSB and
-        // the lookup gives the oldest bit's index (+window-1 for the newest).
-        // Reverse: the time-reversed window is the natural forward order, and the
-        // lookup gives the newest bit's index directly.
-        let looked = match direction {
+        // Pack the window into an LFSR state once; both sides look up the same
+        // state in their own map. Forward: oldest bit is the LSB and the lookup
+        // gives the oldest bit's index (+window-1 for the newest). Reverse: the
+        // time-reversed window is the natural forward order and the lookup gives
+        // the newest bit's index directly.
+        let (state, adjust) = match direction {
             Direction::Reverse => {
                 let rev: Vec<u8> = self.bits.iter().rev().copied().collect();
-                self.map
-                    .position_of_state(pack_state(&rev))
-                    .map(|k| k as i64)
+                (pack_state(&rev), false)
             }
             _ => {
                 let win: Vec<u8> = self.bits.iter().copied().collect();
-                self.map
-                    .position_of_state(pack_state(&win))
-                    .map(|k| self.wrap(k as i64 + self.window_bits as i64 - 1))
+                (pack_state(&win), true)
             }
         };
 
-        // Predicted newest position from the previous result.
         let step: i64 = match direction {
             Direction::Forward => 1,
             Direction::Reverse => -1,
             Direction::Stopped => 0,
         };
-        let predicted = self.last_pos.map(|p| self.wrap(p + step));
 
-        let pos = match (looked, predicted) {
-            (Some(l), Some(p)) => {
-                if l == p {
-                    self.lock_count = (self.lock_count + 1).min(self.cfg.lock_threshold * 2);
-                    self.disagree_count = 0;
-                    l
+        // Advance each side's tracker against the shared window. Only the side
+        // whose polynomial matches produces continuous positions and builds a
+        // lock; the wrong side's lookups are uncorrelated and never agree.
+        let period = self.period;
+        let window_bits = self.window_bits;
+        let cfg = self.cfg;
+        for t in self.tracks.iter_mut() {
+            let looked = t.map.position_of_state(state).map(|k| {
+                if adjust {
+                    wrap_i(k as i64 + window_bits as i64 - 1, period)
                 } else {
-                    // Bit error (or a real jump/scratch). Hold the prediction for
-                    // a few cycles, then trust the lookup and re-sync.
-                    self.lock_count = 0;
-                    self.disagree_count += 1;
-                    if self.disagree_count >= self.cfg.resync_after {
-                        self.disagree_count = 0;
-                        l
-                    } else {
-                        p
+                    k as i64
+                }
+            });
+            Self::advance_track(t, looked, step, period, &cfg);
+        }
+
+        // Identify the side by sustained agreement rate (see `SideTrack`). Pick
+        // the highest-rate side once it clears the confidence threshold; keep the
+        // choice sticky (persists through dropouts) and only switch if another
+        // side is convincingly better, so a marginal recording doesn't flip.
+        let warmed = strong && self.warmup >= self.cfg.warmup_bits;
+        if warmed {
+            let best = self
+                .tracks
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| {
+                    a.agree_ema.partial_cmp(&b.agree_ema).unwrap_or(core::cmp::Ordering::Equal)
+                })
+                .map(|(i, _)| i)
+                .unwrap();
+            if self.tracks[best].agree_ema >= SIDE_CONFIDENCE {
+                match self.selected {
+                    None => self.selected = Some(best),
+                    Some(cur)
+                        if best != cur
+                            && self.tracks[best].agree_ema
+                                > self.tracks[cur].agree_ema + SIDE_SWITCH_MARGIN =>
+                    {
+                        self.selected = Some(best)
                     }
+                    _ => {}
                 }
             }
-            (Some(l), None) => {
-                // First fix.
-                self.lock_count = 0;
-                l
-            }
-            (None, Some(p)) => {
-                // Unresolvable window (e.g. all-zero from silence); coast.
-                self.lock_count = 0;
-                p
-            }
-            (None, None) => {
-                return Some(DecodeState {
-                    position_bits: f64::NAN,
-                    position_seconds: f64::NAN,
-                    pitch,
-                    direction,
-                    locked: false,
-                    confidence: ev.confidence,
-                    signal: ev.signal,
-                    fine_position: self.fine_pos,
-                    sample: ev.sample,
-                });
-            }
-        };
+        }
 
-        self.last_pos = Some(pos);
-        let locked =
-            strong && self.warmup >= self.cfg.warmup_bits && self.lock_count >= self.cfg.lock_threshold;
+        // Authoritative output comes from the latched side (if any).
+        let (pos, side, locked) = match self.selected {
+            Some(i) => {
+                let t = &self.tracks[i];
+                let locked = warmed && t.lock_count >= self.cfg.lock_threshold;
+                (t.last_pos, Some(t.side), locked)
+            }
+            None => (None, None, false),
+        };
 
         // Re-anchor the sub-bit interpolator to each locked cycle so it stays
         // exact and drift is bounded to a single bit between events.
         if locked {
-            self.anchor_pos = pos;
-            self.anchor_phase = self.frontend.phase_total();
-            self.have_anchor = true;
-            self.fine_pos = pos as f64;
+            if let Some(p) = pos {
+                self.anchor_pos = p;
+                self.anchor_phase = self.frontend.phase_total();
+                self.have_anchor = true;
+                self.fine_pos = p as f64;
+            }
         }
 
+        let position_bits = pos.map(|p| p as f64).unwrap_or(f64::NAN);
         Some(DecodeState {
-            position_bits: pos as f64,
-            position_seconds: pos as f64 / self.fmt.carrier_hz as f64,
+            position_bits,
+            position_seconds: pos
+                .map(|p| p as f64 / self.fmt.carrier_hz as f64)
+                .unwrap_or(f64::NAN),
             pitch,
             direction,
+            side,
             locked,
             confidence: ev.confidence,
             signal: ev.signal,
-            fine_position: if locked { pos as f64 } else { self.fine_pos },
+            fine_position: if locked { position_bits } else { self.fine_pos },
             sample: ev.sample,
         })
     }
@@ -382,10 +509,16 @@ impl Decoder {
     }
 }
 
+/// Reduce `v` into `[0, period)`.
+#[inline]
+fn wrap_i(v: i64, period: i64) -> i64 {
+    ((v % period) + period) % period
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::format::serato_cv02;
+    use crate::format::{serato_cv02, serato_cv02_side_a, serato_cv02_side_b};
     use crate::synth::Encoder;
 
     fn render(start_bits: f64, pitch: f64, n: usize) -> (Vec<(f32, f32)>, TimecodeFormat, f32) {
@@ -396,6 +529,16 @@ mod tests {
         let mut buf = Vec::new();
         enc.render_const(pitch, n, &mut buf);
         (buf, fmt, sr)
+    }
+
+    /// Render a specific side's tone (both sides share front-end params, so the
+    /// decoder's `fmt` arg doesn't decide the side — the LFSR in the audio does).
+    fn render_side(fmt: &TimecodeFormat, start_bits: f64, pitch: f64, n: usize) -> Vec<(f32, f32)> {
+        let mut enc = Encoder::new(fmt.clone(), 44_100.0);
+        enc.seek_bits(start_bits);
+        let mut buf = Vec::new();
+        enc.render_const(pitch, n, &mut buf);
+        buf
     }
 
     #[test]
@@ -539,5 +682,86 @@ mod tests {
             dec.signal_level(),
             dec.min_signal()
         );
+    }
+
+    #[test]
+    fn detects_side_a() {
+        // Side A tone -> the decoder resolves side A on the state and via `side()`.
+        let buf = render_side(&serato_cv02_side_a(), 12_345.0, 1.0, 60_000);
+        let mut dec = Decoder::new(serato_cv02(), 44_100.0);
+        let states = dec.process(&buf);
+        let locked: Vec<_> = states.iter().filter(|s| s.locked).collect();
+        assert!(!locked.is_empty(), "never locked");
+        assert_eq!(dec.side(), Some(Side::A));
+        assert!(locked.iter().all(|s| s.side == Some(Side::A)));
+    }
+
+    #[test]
+    fn detects_side_b() {
+        // Same decoder, side B tone -> resolves side B. The side comes from the
+        // LFSR in the audio, not from the format passed to the decoder.
+        let buf = render_side(&serato_cv02_side_b(), 500_000.0, 1.0, 60_000);
+        let mut dec = Decoder::new(serato_cv02(), 44_100.0);
+        let states = dec.process(&buf);
+        assert!(states.iter().any(|s| s.locked), "never locked");
+        assert_eq!(dec.side(), Some(Side::B));
+        assert!(states.iter().filter(|s| s.locked).all(|s| s.side == Some(Side::B)));
+    }
+
+    #[test]
+    fn detects_side_b_in_reverse() {
+        // Direction is orthogonal to side: reverse side B still reads as side B.
+        let buf = render_side(&serato_cv02_side_b(), 500_000.0, -1.0, 60_000);
+        let mut dec = Decoder::new(serato_cv02(), 44_100.0);
+        dec.process(&buf);
+        assert_eq!(dec.side(), Some(Side::B));
+    }
+
+    #[test]
+    fn side_is_none_until_locked_and_then_latches() {
+        // Before any lock the side is unknown; once resolved it stays set even
+        // through a following dropout (no carrier), so hosts can rely on it.
+        let buf = render_side(&serato_cv02_side_a(), 200_000.0, 1.0, 60_000);
+        let mut dec = Decoder::new(serato_cv02(), 44_100.0);
+        assert_eq!(dec.side(), None);
+
+        let mut side_before_first_lock_seen_as_none = true;
+        let mut resolved = false;
+        for &(l, r) in &buf {
+            if let Some(s) = dec.push_frame(l, r) {
+                if !resolved {
+                    if s.side.is_none() {
+                        // still fine: unresolved
+                    } else {
+                        resolved = true;
+                    }
+                }
+                if !resolved && s.locked {
+                    // a locked state must carry a side
+                    side_before_first_lock_seen_as_none = false;
+                }
+            }
+        }
+        assert!(resolved, "side never resolved");
+        assert!(side_before_first_lock_seen_as_none, "locked state had no side");
+        assert_eq!(dec.side(), Some(Side::A));
+
+        // Dropout: pure silence. Side must remain latched.
+        for _ in 0..30_000 {
+            dec.push_frame(0.0, 0.0);
+        }
+        assert_eq!(dec.side(), Some(Side::A), "side must persist through dropout");
+    }
+
+    #[test]
+    fn no_side_on_noise_floor() {
+        // Sub-carrier input (below min_signal) never passes the signal gate, so no
+        // side is ever claimed. Detection requires an actual control tone.
+        let mut buf = alloc::vec![(0.0f32, 0.0f32); 60_000];
+        Encoder::add_noise(&mut buf, 0.005, 0x1234); // < default min_signal (0.01)
+        let mut dec = Decoder::new(serato_cv02(), 44_100.0);
+        let states = dec.process(&buf);
+        assert!(states.iter().all(|s| s.side.is_none()));
+        assert_eq!(dec.side(), None);
     }
 }

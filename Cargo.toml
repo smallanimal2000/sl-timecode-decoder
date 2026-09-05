@@ -64,6 +64,10 @@ name = "fulldecode"
 required-features = ["wav"]
 
 [[example]]
+name = "detect"
+required-features = ["wav"]
+
+[[example]]
 name = "scratch_demo"
 required-features = ["synth", "wav"]
 

@@ -127,6 +127,35 @@ pub fn serato_cv02() -> TimecodeFormat {
     serato_cv02_side_a()
 }
 
+/// Which pressed side of a Serato CV02 record is playing.
+///
+/// The two sides use distinct LFSR polynomials so software can tell them apart;
+/// the [`Decoder`](crate::Decoder) infers this from the audio and reports it on
+/// [`DecodeState::side`](crate::DecodeState::side).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    A,
+    B,
+}
+
+impl Side {
+    /// The measured [`TimecodeFormat`] for this side.
+    pub fn format(self) -> TimecodeFormat {
+        match self {
+            Side::A => serato_cv02_side_a(),
+            Side::B => serato_cv02_side_b(),
+        }
+    }
+
+    /// Short human-readable label (`"A"` / `"B"`).
+    pub fn label(self) -> &'static str {
+        match self {
+            Side::A => "A",
+            Side::B => "B",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
