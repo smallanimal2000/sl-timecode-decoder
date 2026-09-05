@@ -31,6 +31,14 @@ libm = "0.2"
 hound = { version = "3", optional = true }
 rustfft = { version = "6", optional = true }
 
+[[test]]
+name = "roundtrip"
+# Uses the synthetic encoder (`synth`). Without this, a plain `cargo test` would
+# try to compile the test and fail on the gated `synth` module; declaring the
+# requirement makes cargo skip it unless the feature is on. The ignored
+# real-recording case is additionally `#[cfg(feature = "wav")]` inside the file.
+required-features = ["synth"]
+
 [[example]]
 name = "encode"
 required-features = ["synth", "wav"]
