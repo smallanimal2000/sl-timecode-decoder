@@ -33,6 +33,7 @@ pub trait FloatExt {
     fn sin(self) -> Self;
     fn cos(self) -> Self;
     fn atan2(self, other: Self) -> Self;
+    fn exp(self) -> Self;
     fn powf(self, n: Self) -> Self;
     fn floor(self) -> Self;
     fn round(self) -> Self;
@@ -60,6 +61,10 @@ impl FloatExt for f32 {
     #[inline]
     fn atan2(self, other: f32) -> f32 {
         libm::atan2f(self, other)
+    }
+    #[inline]
+    fn exp(self) -> f32 {
+        libm::expf(self)
     }
     #[inline]
     fn powf(self, n: f32) -> f32 {
@@ -115,6 +120,10 @@ impl FloatExt for f64 {
         libm::atan2(self, other)
     }
     #[inline]
+    fn exp(self) -> f64 {
+        libm::exp(self)
+    }
+    #[inline]
     fn powf(self, n: f64) -> f64 {
         libm::pow(self, n)
     }
@@ -142,6 +151,35 @@ impl FloatExt for f64 {
             }
         } else {
             q
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FloatExt;
+
+    // Regression guard: the `no_std` build gets its transcendental math from this
+    // shim, so every float method used at a call site must exist on `FloatExt` —
+    // otherwise `--no-default-features` fails to compile while `std` stays green
+    // (as happened when `dsp` added an `.exp()` for the carrier-presence envelope).
+    // These call the methods through fully-qualified trait syntax so the inherent
+    // `std` methods can't shadow them: if the trait ever loses one, this test stops
+    // compiling. The shim exists to match `std`'s numeric behavior, so also assert
+    // the results agree with the inherent methods within f32/f64 tolerance.
+    #[test]
+    fn exp_shim_matches_std() {
+        for &x in &[-3.0f32, -1.0, 0.0, 1.0, 2.5] {
+            assert!(
+                (FloatExt::exp(x) - x.exp()).abs() < 1e-5,
+                "f32 exp({x}) shim diverged"
+            );
+        }
+        for &x in &[-3.0f64, -1.0, 0.0, 1.0, 2.5] {
+            assert!(
+                (FloatExt::exp(x) - x.exp()).abs() < 1e-12,
+                "f64 exp({x}) shim diverged"
+            );
         }
     }
 }

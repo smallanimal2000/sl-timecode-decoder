@@ -31,7 +31,8 @@ pub struct BitEvent {
     pub sample: u64,
     /// Signed pitch estimate at slice time (1.0 == nominal forward speed).
     pub pitch: f32,
-    /// Carrier signal level (tracked high-peak level, ~full-scale) at slice time.
+    /// Carrier signal level (per-sample peak envelope, ~full-scale) at slice time.
+    /// Decays toward the noise floor when the carrier stops.
     pub signal: f32,
     /// The measured lead-channel peak magnitude for this bit (diagnostics).
     pub peak: f32,
@@ -76,6 +77,11 @@ pub struct SlicerConfig {
     pub init_lo_ratio: f32,
     /// EMA rate for the pitch/velocity estimate.
     pub pitch_alpha: f32,
+    /// Release time of the carrier-presence envelope, in carrier cycles. The
+    /// envelope attacks instantly to each lead peak and decays with this time
+    /// constant when the carrier is absent, so a stylus lift (silence) is seen
+    /// as the level collapsing toward the noise floor within a few cycles.
+    pub env_release_cycles: f32,
 }
 
 impl Default for SlicerConfig {
@@ -88,6 +94,7 @@ impl Default for SlicerConfig {
             refractory_frac: 0.4,
             init_lo_ratio: 0.85,
             pitch_alpha: 0.05,
+            env_release_cycles: 6.0,
         }
     }
 }
@@ -125,6 +132,14 @@ pub struct Frontend {
     /// Follower tracking the "low" (bit=0) peak cluster.
     level_lo: f32,
 
+    /// Per-sample peak envelope of |lead| for carrier-presence detection. Unlike
+    /// `level_hi` (a bi-level cluster follower updated only at crossings), this is
+    /// updated every sample and decays during silence, so it collapses when the
+    /// stylus is lifted and the carrier disappears.
+    env: f32,
+    /// Per-sample decay factor applied to `env` when the input is below it.
+    env_decay: f32,
+
     sample_idx: u64,
 }
 
@@ -134,6 +149,11 @@ impl Frontend {
     }
 
     pub fn with_config(fmt: &TimecodeFormat, sample_rate: f32, cfg: SlicerConfig) -> Self {
+        // Envelope release: decay per sample so the level falls with a time
+        // constant of `env_release_cycles` carrier cycles when the carrier stops.
+        let base_period = sample_rate / fmt.carrier_hz; // samples per cycle at 1x
+        let tau = (cfg.env_release_cycles.max(0.5)) * base_period;
+        let env_decay = (-1.0 / tau).exp();
         Frontend {
             lead: fmt.lead,
             nominal_w: 2.0 * PI * fmt.carrier_hz / sample_rate,
@@ -152,6 +172,8 @@ impl Frontend {
             xh_idx: 0,
             level_hi: 1e-6,
             level_lo: 1e-6,
+            env: 0.0,
+            env_decay,
             sample_idx: 0,
         }
     }
@@ -169,10 +191,13 @@ impl Frontend {
         self.phase_total
     }
 
-    /// Current carrier signal level (tracked high-peak level, ~full scale).
+    /// Current carrier signal level: a per-sample peak envelope of the lead
+    /// channel (~full scale while the carrier is present). Decays toward the
+    /// noise floor when the carrier stops — e.g. on a stylus lift — so it can be
+    /// compared against a presence threshold even between/without crossings.
     #[inline]
     pub fn signal_level(&self) -> f32 {
-        self.level_hi
+        self.env
     }
 
     /// Map a raw `(l, r)` frame to `(x = lead, y = lag)`.
@@ -194,8 +219,19 @@ impl Frontend {
         let y = self.dc_y.process(ry);
 
         // Keep a short history of |lead| for windowed (noise-averaging) peak reads.
-        self.xhist[self.xh_idx] = x.abs();
+        let ax = x.abs();
+        self.xhist[self.xh_idx] = ax;
         self.xh_idx = (self.xh_idx + 1) % self.xhist.len();
+
+        // Carrier-presence envelope: instant attack to each lead peak, exponential
+        // release when the input is lower. Tracked every sample (not just at
+        // crossings) so it decays to the noise floor when the carrier disappears,
+        // making a stylus lift observable via `signal_level()`.
+        if ax > self.env {
+            self.env = ax;
+        } else {
+            self.env *= self.env_decay;
+        }
 
         // --- phase / pitch tracking ---
         let theta = y.atan2(x);
@@ -297,7 +333,7 @@ impl Frontend {
                 confidence,
                 sample: idx,
                 pitch: self.pitch(),
-                signal: self.level_hi,
+                signal: self.env,
                 peak,
             });
         }

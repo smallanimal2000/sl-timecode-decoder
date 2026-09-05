@@ -219,3 +219,214 @@ Nyquist folding point. Above typical scratch speeds, so left as-is.
     footprint is the deployment constraint to plan for.
   - Verify with `cargo build --no-default-features [--features synth]` and
     `cargo build --target wasm32-unknown-unknown [--no-default-features]`.
+
+---
+
+## 8. Continuous motion-state API (`Decoder::pitch/signal_level/phase_total/moving`)
+
+Purely additive getters on `Decoder` that delegate to the internal `Frontend`, so
+a host can **poll** motion state on a fixed cadence (e.g. once per audio block)
+instead of only reading it off `push_frame`'s `Some(..)` return (which fires only
+~once per carrier cycle). Motivation: the wasm binding was running a *second*
+parallel `Frontend` purely to poll `pitch()`, doubling the per-sample front-end
+DSP and risking slicer-config drift between the two front ends. These getters let
+that companion be deleted.
+
+- `pitch() -> f32`, `signal_level() -> f32`, `phase_total() -> f64` — mirror the
+  same-named `Frontend` methods. Pure reads; **do not advance state**.
+- `moving() -> bool` — convenience: `signal_level() >= min_signal && |pitch| >=
+  stop_pitch`. Intentionally does **not** require position lock — relative/scratch
+  control needs *motion*, not *position*. `fine_position()` stays the position
+  authority (still `None`/`NaN` until locked); these are the motion authority.
+
+> **⚠️ SUPERSEDED by §9 (stylus-lift fix).** The freeze described in this block was
+> the bug behind "fails to detect a stylus lift." `signal_level()` now returns a
+> per-sample decaying peak envelope and *does* fall below `min_signal` on silence.
+> The `moving()`/`stop_pitch` reasoning below still holds; the "signal_level stays
+> frozen" claims do not. Left here for the archaeology.
+
+**The pitfall that mattered here — `signal_level()` used to NOT decay on silence.**
+The consumer's suggested test (prescription §5) assumed that after the carrier
+goes silent, `signal_level()` "decays below `min_signal` within a bounded number
+of samples." At the time it didn't: `signal_level()` returned `level_hi`, the
+peak-cluster follower, which was **only updated inside the crossing branch** of
+`Frontend::push` (`dsp.rs`, `if crossing { … self.level_hi += … }`). Hard silence
+produces no zero-crossings → the follower was **frozen** at its last value, not
+decayed. So (at the time):
+
+  - **Do not use `signal_level()` alone to detect "needle lifted / carrier gone."**
+    It will read stale-high indefinitely after an abrupt stop.
+  - `moving()` still reports stopped correctly, but via the **pitch** term, not the
+    signal term: `vel_ema` (hence `pitch()`) *is* updated every sample (outside the
+    crossing branch), and on silence `atan2(0,0)=0 → dθ=0`, so it relaxes to ~0 and
+    the `stop_pitch` gate trips. If `stop_pitch` were ever set to 0, `moving()`
+    would get stuck true on silence — the deadband is load-bearing.
+  - Consequence for hosts: treat `moving()` (or `pitch()`) as the stop signal.
+    `signal_level()` is a carrier-*presence* indicator that updates only while the
+    carrier is actually crossing.
+
+**`stop_pitch = 0.02` has no documented derivation.** It arrived in the initial
+commit with no provenance in code, git history, README, or this file — unlike the
+measured per-side Serato params (§1), it is a hand-picked deadband meaning "under
+2% of nominal speed = stopped." Plausible, but not tied to any measurement. If you
+touch stop/deadband behavior, either derive it from data or leave a comment; don't
+treat it as validated the way taps/seeds/lead are.
+
+**Test lesson — don't duplicate a config constant into an assertion.** My first
+stop-detection test hardcoded `0.02` as the threshold (copied from the config
+default). That's a silent-staleness trap: retune `stop_pitch` and the test's
+premise rots without failing for the right reason. Fixed by asserting the *intent*
+("pitch relaxed to rest", `|pitch| < 1e-3`) plus `!moving()` (which reads the real
+`cfg.stop_pitch`). There is no `stop_pitch()` getter on `Decoder` to reference
+directly; add one if a test genuinely needs the live value. General rule: assert
+behavior/intent, or read the live config — never re-encode a magic number.
+
+**Tests added** (`decoder.rs`): poll-equivalence (`pitch()`/`signal_level()` match
+the most recent `DecodeState`), pitch tracks a reverse trajectory through lock
+state, and stop-after-silence (pitch → rest, `moving()` false). Build is clean
+with and without the `synth`/`std` features; the getters add no state, no alloc,
+and don't touch `push_frame` output — backwards compatible.
+
+---
+
+## 9. Stylus-lift detection — `signal_level()` now decays on silence
+
+**Symptom reported:** "the library fails to detect a stylus lift." Lifting the
+needle removes the carrier entirely; a host watching `signal_level()` against
+`min_signal` to notice the record leaving the platter never saw the level drop.
+
+**Root cause (the §8 freeze, now fixed).** `signal_level()` and `BitEvent.signal`
+both returned `self.level_hi` — a bi-level *slicer* cluster follower updated **only
+inside the `if crossing` branch** of `Frontend::push`, i.e. once per carrier cycle
+at a zero-crossing. A stylus lift stops the crossings, so `level_hi` froze at its
+last value and the reported level stayed pinned high forever. The mechanism is a
+crossing-gated *slice threshold*, not a presence detector — using it as a presence
+detector was the category error.
+
+**Fix (`dsp.rs`).** Added a dedicated per-sample carrier-presence envelope,
+separate from the slicer levels:
+
+- New `Frontend.env` (+ precomputed `env_decay`): **instant attack** to each
+  `|lead|` peak, **exponential release** when the sample is below it. Updated on
+  **every** sample (outside the crossing branch), so it tracks ~full-scale while
+  the carrier is present and decays toward the noise floor when it stops.
+- `signal_level()` and `BitEvent.signal` now report `env`; `level_hi`/`level_lo`
+  are untouched and still drive slicing/hysteresis. Clean separation:
+  **`level_hi` = slice reference (crossing-gated); `env` = presence (per-sample).**
+- Release is time-constant `env_release_cycles` (default **6** carrier cycles) ×
+  base period, so it's **sample-rate independent** (computed from `sample_rate /
+  carrier_hz` in the constructor). ~26 ms from full scale to −40 dBFS at 1 kHz/44.1k
+  — fast enough for lift detection, slow enough that the ~15% intra-cycle ripple
+  (`exp(-1/6)≈0.85` between peaks) stays far above `min_signal`.
+
+**What did NOT change, and the residual gotcha.** Bits are still sliced only at
+crossings, so a lift emits **no** `DecodeState` — `push_frame` returns `None` and
+the last emitted state's `locked` flag goes **stale**. Detection is therefore a
+**poll**: watch `signal_level()` (now decays) and/or `moving()`. Two distinct stop
+kinds, if you need to tell them apart:
+
+- **Stylus lift** (needle up): both channels → silence → `env` collapses →
+  `signal_level() < min_signal`. This is the newly-detectable case.
+- **Platter stop** (needle down, not spinning): the AC carrier also stops, so `env`
+  decays too — physically similar. `moving()` reports stopped in both via the
+  **pitch** term (`vel_ema → 0`), exactly as §8 describes.
+
+If a host needs an event-driven "carrier lost" rather than a poll, add a poll-side
+latch or a `Decoder` method that flips lock off when `signal_level()` stays below
+`min_signal` for N samples — deliberately **not** added here (keeps the fix minimal
+and `push_frame`-output-compatible).
+
+**Test added** (`decoder.rs::stylus_lift_drops_signal_level`): carrier present →
+`signal_level() ≥ min_signal`; then feed pure silence → assert it decays **below**
+`min_signal`. This is the regression that the old frozen-follower behaviour failed.
+All 16 lib tests + 16 stress/integration tests (incl. noise-floor, dropout,
+needle-skip — same signal path) + doctest pass, with and without `synth`/`std`.
+
+**Durable lessons:**
+
+1. **A crossing-gated value is not a continuous sensor.** Anything updated only
+   inside an event branch (here, per zero-crossing) is undefined between events and
+   *frozen* when events stop. If a consumer polls it as a live signal, it will read
+   stale exactly when the interesting thing (silence/stop) happens. Give presence
+   its own per-sample follower; don't overload the slicer's threshold state.
+2. **"Attack fast, release slow" peak envelope is the right primitive for presence.**
+   Instant attack tracks the true peak; exponential release makes absence *decay*
+   rather than freeze. Tie the release to the signal's own period so it's
+   sample-rate independent.
+3. **Separate the two roles a "level" plays.** One number was doing double duty as
+   slice reference *and* presence indicator; they have opposite update cadences
+   (per-crossing vs per-sample). Splitting them fixed the bug without perturbing
+   slicing.
+4. **When you document a limitation (§8), a later fix must go back and supersede it.**
+   §8 codified the freeze as permanent guidance ("do not use `signal_level()` to
+   detect needle-lifted"). Leaving that standing after fixing it would mislead the
+   next reader worse than never having written it. Mark, don't silently delete.
+
+---
+
+## 10. `no_std` regression — `.exp()` from the §9 fix broke the shim build
+
+**Symptom.** The §9 stylus-lift fix precomputes an exponential release constant in
+`Frontend::with_config` (`dsp.rs`):
+
+```rust
+let env_decay = (-1.0 / tau).exp();
+```
+
+`cargo build` (default, `std`) was green, so this shipped in commit `3c0f812`. But
+`cargo build --no-default-features` fails:
+
+```
+error[E0599]: no method named `exp` found for type `f32` in the current scope
+   --> src/dsp.rs:156:38
+```
+
+**Root cause.** `f32::exp`/`f64::exp` are **`std` inherent methods** — `core` does
+not provide them. On `no_std` targets the transcendental math comes from the
+`math::FloatExt` libm shim (§7), which had `sin`/`cos`/`atan2`/`sqrt`/`powf`/
+`floor`/`round`/`trunc`/`div_euclid` but **no `exp`**. So under `std` the inherent
+method resolved the call and hid the gap; under `no_std` there was nothing to
+resolve it. Classic "green on the default feature set, broken on the one nobody
+built locally."
+
+**Fix (`math.rs`).** Added `exp` to `FloatExt` for both float types, backed by
+`libm::expf` (f32) and `libm::exp` (f64), following the existing pattern. Under
+`std` the inherent method still wins, so hosted numeric behavior is unchanged;
+under `no_std` the shim now fills the gap. Both `cargo build` and
+`cargo build --no-default-features` are green again.
+
+**Regression test (`math.rs::tests::exp_shim_matches_std`).** The subtle part:
+a normal `#[test]` runs under `std`, where the inherent `exp` wins — so a naive
+`x.exp()` test would pass *even if the shim method were missing* and never catch
+the regression. Two properties make the test actually guard the shim:
+
+- The `math` module is compiled **unconditionally** (§7 — it's kept non-optional so
+  `libm` isn't flagged unused under `std`), so `FloatExt` is reachable from a
+  standard `std` test build. No `no_std` target needed to exercise it.
+- The test calls **`FloatExt::exp(x)` via fully-qualified trait syntax**, not
+  `x.exp()`. That forces resolution to the *trait* method, so the inherent `std`
+  method can't shadow it. If `exp` ever leaves `FloatExt` again, the test **fails
+  to compile** — a compile-time tripwire on the trait's surface. It also asserts
+  the libm result agrees with `std`'s inherent `exp` (the shim's whole job is to
+  match `std` numeric behavior): tol `1e-5` for f32, `1e-12` for f64.
+
+**Durable lessons:**
+
+1. **A feature flag you don't build is a feature flag you break.** `std` is the
+   default; every plain `cargo build`/`test` exercises it and *only* it. Any new
+   transcendental/rounding float call is invisible to the default build and only
+   bites `--no-default-features`. **Always run `cargo build --no-default-features`
+   (and the `wasm32` target, §7) after touching numeric core code** — ideally in
+   CI, which this repo still lacks (open item).
+2. **Adding a float method at a call site is also a shim change.** The `FloatExt`
+   trait must stay a superset of every float method used in `no_std`-compiled
+   modules (`format`, `lfsr`, `dsp`, `decoder`, `synth`). Before using a new one
+   (`exp`, `tan`, `ln`, `hypot`, …), check it's in the shim; if not, add it with its
+   `libm::*f`/`libm::*` backing in the same commit.
+3. **Test the trait surface via fully-qualified syntax so inherent methods can't
+   mask a gap.** When a shim exists precisely because inherent methods sometimes
+   win, a plain method-call test proves nothing about the shim. `Trait::method(x)`
+   pins resolution to the trait and turns a missing method into a compile error.
+4. **Green-on-default ≠ green.** The `std`-only pass in §9 is exactly why this
+   slipped through. Match the guard to the surface you actually ship — here, all
+   feature permutations, not just the convenient one.

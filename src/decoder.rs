@@ -49,7 +49,8 @@ pub struct DecodeState {
     pub locked: bool,
     /// Slice confidence of the bit that produced this state, in `[0, 1]`.
     pub confidence: f32,
-    /// Carrier signal level (tracked peak envelope, ~full scale) at this state.
+    /// Carrier signal level (per-sample peak envelope, ~full scale) at this state.
+    /// Decays toward the noise floor when the carrier stops (e.g. stylus lift).
     pub signal: f32,
     /// Sub-bit interpolated absolute position (bits), smooth between crossings.
     /// Same as `position_bits` at a resolved cycle, but continuously refined from
@@ -155,6 +156,46 @@ impl Decoder {
 
     pub fn min_signal(&self) -> f32 {
         self.cfg.min_signal
+    }
+
+    /// Current signed pitch estimate (1.0 == nominal forward speed).
+    ///
+    /// Continuous motion state: valid between bit events and through lock loss,
+    /// so hosts can poll it on a fixed cadence (e.g. once per audio block)
+    /// rather than only on the `Some(..)` return of [`push_frame`](Self::push_frame).
+    /// Pure read; does not advance any state. Intentionally does not require a
+    /// position lock — relative/scratch control needs motion, not position.
+    #[inline]
+    pub fn pitch(&self) -> f32 {
+        self.frontend.pitch()
+    }
+
+    /// Current carrier signal level (per-sample peak envelope, ~full scale).
+    ///
+    /// Continuous motion state; compare against [`min_signal`](Self::min_signal)
+    /// to decide carrier presence. Decays toward the noise floor when the carrier
+    /// stops, so a stylus lift is observable here even though no bit events fire.
+    /// Pure read; does not advance any state.
+    #[inline]
+    pub fn signal_level(&self) -> f32 {
+        self.frontend.signal_level()
+    }
+
+    /// Cumulative unwrapped carrier phase in radians (2π per bit).
+    ///
+    /// Useful for host-side sub-bit interpolation. Pure read; does not advance
+    /// any state.
+    #[inline]
+    pub fn phase_total(&self) -> f64 {
+        self.frontend.phase_total()
+    }
+
+    /// True when the carrier is present and the record is moving fast enough to
+    /// trust the signed [`pitch`](Self::pitch), independent of bit-level position
+    /// lock. Uses the existing `min_signal` and `stop_pitch` thresholds.
+    #[inline]
+    pub fn moving(&self) -> bool {
+        self.signal_level() >= self.cfg.min_signal && self.pitch().abs() >= self.cfg.stop_pitch
     }
 
     /// Current sub-bit interpolated absolute position (bits), or `None` if not
@@ -413,5 +454,90 @@ mod tests {
             }
         }
         assert!(checked > 100, "not enough locked samples: {checked}");
+    }
+
+    #[test]
+    fn poll_pitch_matches_last_event() {
+        // Polling `pitch()` between events returns the same value carried on the
+        // most recent `DecodeState` (they read the same front end).
+        let (buf, fmt, sr) = render(12_345.0, 1.0, 60_000);
+        let mut dec = Decoder::new(fmt, sr);
+        let mut checked = 0;
+        for &(l, r) in &buf {
+            if let Some(s) = dec.push_frame(l, r) {
+                assert!((dec.pitch() - s.pitch).abs() < 1e-6, "poll {} vs event {}", dec.pitch(), s.pitch);
+                assert!((dec.signal_level() - s.signal).abs() < 1e-6);
+                checked += 1;
+            }
+        }
+        assert!(checked > 100, "not enough events: {checked}");
+    }
+
+    #[test]
+    fn pitch_follows_reverse_through_lock_state() {
+        // Signed pitch tracks a reverse trajectory regardless of position lock.
+        let (buf, fmt, sr) = render(500_000.0, -1.0, 60_000);
+        let mut dec = Decoder::new(fmt, sr);
+        for &(l, r) in &buf {
+            dec.push_frame(l, r);
+        }
+        assert!(dec.pitch() < 0.0, "expected reverse pitch, got {}", dec.pitch());
+        assert!(dec.moving(), "reverse at nominal speed should be moving");
+    }
+
+    #[test]
+    fn stop_detection_after_silence() {
+        // After the carrier goes silent, `moving()` becomes false: the front end's
+        // signed pitch (updated every sample) decays to ~0 so the `stop_pitch`
+        // gate trips, and the per-sample peak-envelope `signal_level()` decays
+        // below `min_signal`. `moving()` must not report a stale "moving" state.
+        let (buf, fmt, sr) = render(12_345.0, 1.0, 20_000);
+        let mut dec = Decoder::new(fmt, sr);
+        for &(l, r) in &buf {
+            dec.push_frame(l, r);
+        }
+        assert!(dec.moving(), "should be moving while carrier present");
+        // Feed silence; there are no crossings, so pitch relaxes toward zero.
+        for _ in 0..40_000 {
+            dec.push_frame(0.0, 0.0);
+        }
+        // Pitch relaxes to rest (well below any sane stop_pitch deadband); assert
+        // near-zero rather than pinning to the exact config threshold.
+        assert!(
+            dec.pitch().abs() < 1e-3,
+            "pitch {} did not relax toward rest",
+            dec.pitch()
+        );
+        assert!(!dec.moving(), "silent carrier must not report as moving");
+    }
+
+    #[test]
+    fn stylus_lift_drops_signal_level() {
+        // A stylus lift removes the carrier entirely. Because bits are only sliced
+        // at carrier crossings, no `DecodeState` is emitted once the signal stops —
+        // so a host must be able to detect the lift by polling `signal_level()`.
+        // Regression: the level used to be a bi-level follower updated only at
+        // crossings, so it froze at its last value on silence and the lift was
+        // never observable. It must now decay below `min_signal`.
+        let (buf, fmt, sr) = render(12_345.0, 1.0, 20_000);
+        let mut dec = Decoder::new(fmt, sr);
+        for &(l, r) in &buf {
+            dec.push_frame(l, r);
+        }
+        assert!(
+            dec.signal_level() >= dec.min_signal(),
+            "carrier present should read as signal, got {}",
+            dec.signal_level()
+        );
+        // Lift the stylus: pure silence, no crossings.
+        for _ in 0..20_000 {
+            dec.push_frame(0.0, 0.0);
+        }
+        assert!(
+            dec.signal_level() < dec.min_signal(),
+            "signal_level {} did not decay below min_signal {} after stylus lift",
+            dec.signal_level(),
+            dec.min_signal()
+        );
     }
 }
