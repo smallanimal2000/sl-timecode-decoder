@@ -1,0 +1,64 @@
+[package]
+name = "sl-timecode-decoder"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Clean-room decoder for DVS (Serato-style) control-tone timecode"
+repository = ""
+keywords = ["dvs", "timecode", "serato", "vinyl", "dsp"]
+categories = ["multimedia::audio"]
+
+[features]
+default = ["std"]
+# Use the standard library. On by default. Turn it off
+# (`default-features = false`) for `no_std` targets (ESP32, wasm32, …); the core
+# decoder then relies only on `alloc` and gets its float math from `libm`.
+std = []
+# WAV file loading helper (std only), used by tests and examples.
+wav = ["dep:hound", "std"]
+# Synthetic control-tone generator (ground-truth encoder). Enabled automatically
+# under `cfg(test)`; expose via this feature so examples can use it too.
+# `no_std`-compatible (needs only `alloc`).
+synth = []
+# Analysis tooling (FFT-based carrier detection) for the `analyze` example.
+# std only (rustfft).
+analysis = ["dep:rustfft", "std"]
+
+[dependencies]
+# Pure-Rust libm, used for float math on `no_std` targets. Compiled but unused
+# under the `std` feature (std's own math is used there).
+libm = "0.2"
+hound = { version = "3", optional = true }
+rustfft = { version = "6", optional = true }
+
+[[example]]
+name = "encode"
+required-features = ["synth", "wav"]
+
+[[example]]
+name = "analyze"
+required-features = ["analysis", "wav", "synth"]
+
+[[example]]
+name = "roundtrip"
+required-features = ["synth"]
+
+[[example]]
+name = "confirm"
+required-features = ["analysis", "wav", "synth"]
+
+[[example]]
+name = "calibrate"
+required-features = ["analysis", "wav", "synth"]
+
+[[example]]
+name = "fulldecode"
+required-features = ["wav"]
+
+[[example]]
+name = "scratch_demo"
+required-features = ["synth", "wav"]
+
+[[example]]
+name = "stress"
+required-features = ["synth", "wav"]
