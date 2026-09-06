@@ -443,3 +443,95 @@ the regression. Two properties make the test actually guard the shim:
 4. **Green-on-default ≠ green.** The `std`-only pass in §9 is exactly why this
    slipped through. Match the guard to the surface you actually ship — here, all
    feature permutations, not just the convenient one.
+
+---
+
+## 11. Coded lead-in groove — re-calibrated origin + negative positions (2026-09-06)
+
+**Trigger.** New info from the user: the CV carries control codes in a **lead-in
+groove**, plus new recordings `serato-cv02-side-?-start.wav` that begin *right
+after* the lead-in. Asks, in order: (1) calibrate from the `-start` files;
+(2) use the full `serato-cv02-side-?.wav` as references and report lead-in
+timecode as **negative** positions; (3) account for needle-landing noise in the
+`-start` files and, since the timecode is cyclic, derive where the lead-in
+actually ends.
+
+**What the data actually showed** (via throwaway diagnostics, since removed):
+
+- The `-start` files are **not** clean program timecode from sample 0. Their
+  heads are a near-constant AM tone — side A ~92 bits, side B ~88 bits — at a
+  **~4–16 % bit-transition rate vs ~50 % for LFSR/noise**. That is the
+  needle-landing transient / lead-in tone. Program LFSR only becomes
+  self-consistent after it.
+- The lead-in is the **same continuous LFSR** as the program, not a separate
+  code. Decoding the full references, which land *in* the lead-in, locks
+  continuously from negative positions up through 0 into the program (proven:
+  full-file decode, **0 continuity glitches**). So "the lead-in" = program
+  timecode at negative positions, preceded physically by the constant run-in
+  tone.
+- Side B does **not** nearly fill the LFSR period. Under this origin the program
+  covers `[0, ~913k]`, then a **~129k-bit unused gap**, then the lead-in at
+  `[period−6051, period)`. (An earlier note claimed "775 short of the wrap" —
+  that was under a *different* origin and mis-generalized. Occupancy is
+  origin-independent in *shape*; absolute bit counts are not. Don't carry a bit
+  count across an origin change.)
+
+**Changes made:**
+
+- `TimecodeFormat.lead_in_bits: u32` (new field). Decoder folds output positions
+  to signed: `fold_signed`/`fold_signed_f` in `decoder.rs` map any raw cyclic
+  position `>= period − lead_in_bits` to `raw − period`. **Output-only** — the
+  per-side trackers keep `last_pos` cyclic in `[0, period)` so the predict/agree/
+  resync and wrap math are unchanged; the sub-bit `fine_position` anchor also
+  stays raw and is folded only when handed out.
+- Re-calibrated origin (`examples/calibrate.rs` rewritten). Position 0 = **first
+  clean program-LFSR bit** of the `-start` file (first index starting a
+  fully-clean 300-bit forward run); the register state there *is* the seed. No
+  stepping back to "bit 0".
+- Final params: side A `seed 0xafd8e, lead_in_bits 4875`; side B
+  `seed 0x9a9a2, lead_in_bits 6175`. `lead_in_bits` = deepest lead-in lock
+  measured from the full reference (−4783 / −6051) plus ~100-bit margin so the
+  fold threshold sits *just past* the deepest observed lead-in, with the program
+  end (~+807k / +913k) far below it.
+- `crosses_lfsr_wrap_continuously` (tests/roundtrip.rs) updated: the LFSR wrap now
+  coincides with the signed origin, so it asserts a continuous `−1 → 0` crossing
+  and that the negative lead-in region is visited, instead of a raw
+  `period−1 → 0` jump.
+
+**Validation.** Full-file decode both sides: 95.6 % / 97.1 % lock (unchanged),
+first lock in the lead-in (−4775 / −6051), **0 continuity glitches** across
+negative→0→program. 39 tests pass; all 5 build configs (host std/no_std ±synth,
+wasm32) clean.
+
+**Durable lessons:**
+
+1. **A recording that "starts after X" doesn't start clean.** Needle-landing
+   instability corrupts the first ~90 bits (~90 ms). Never trust bit 0 of a drop;
+   never define an origin by *stepping a register back through* the settle region
+   — slips in zero-crossing count there translate 1:1 into origin error. Anchor on
+   the first point the code is **self-consistent** and let the known recurrence
+   carry the meaning backward, not the raw slicer.
+2. **Distinguish structure by transition rate, cheaply.** Constant/low-freq
+   lead-in ≈ 0 % adjacent-bit transitions; LFSR *and* random noise ≈ 50 %. That
+   one statistic separated "lead-in tone" from "program data" without any
+   correlation machinery — but note it does **not** separate LFSR from noise (both
+   ~50 %); for that you still need the recurrence check.
+3. **Model "before the origin" as signed, fold only at the boundary of the data,
+   not at period/2.** A symmetric `> period/2 → negative` fold would misreport any
+   program position past the halfway mark (side A reaches ~+807k > period/2). The
+   fold threshold must sit in the **physical unused gap** between program-end and
+   lead-in-start; find that gap empirically (occupancy sweep) rather than assuming
+   the timecode is short.
+4. **Keep internal state in its natural (cyclic) space; fold only at the output.**
+   Signing `last_pos` in place would have broken `wrap_i` continuity and the
+   sub-bit anchor's `wrap_f`. Presentation transforms belong at the edge, so the
+   invariants the tracker relies on never see them.
+5. **The decoder's origin is the *baked* per-side seed, not the `fmt` you pass
+   `Decoder::new`.** `SideTrack::new(side)` rebuilds its `PositionMap` from
+   `side.format()`. Passing a re-seeded `fmt` (as the old calibrate "verify" step
+   did) silently has no effect on `position_bits`; only editing `format.rs` moves
+   the origin. Verify calibration by editing the source of truth, then decoding.
+6. **Re-derive bit counts after any origin change.** Absolute positions,
+   program-end, "distance to wrap" all shift with the seed. A remembered figure
+   from a prior origin (the "775-bit gap") is worse than no figure — it reads as
+   authoritative. Re-measure; don't reason from a stale absolute.

@@ -9,11 +9,24 @@ keywords = ["dvs", "timecode", "serato", "vinyl", "dsp"]
 categories = ["multimedia::audio"]
 
 [features]
-default = ["std"]
+default = ["std", "map-fast", "map-balanced", "map-compact"]
 # Use the standard library. On by default. Turn it off
 # (`default-features = false`) for `no_std` targets (ESP32, wasm32, …); the core
 # decoder then relies only on `alloc` and gets its float math from `libm`.
 std = []
+
+# Position-map backing stores (see `lfsr::PositionMapKind`). Enable at least one;
+# `PositionMap::build` picks the best enabled store for the target. Embedded
+# builds typically pick exactly one to keep code size and RAM down — e.g. only
+# `map-fast` for an ESP32 with a PSRAM-backed allocator, or only `map-compact`
+# for a bare SRAM target. All three are on by default.
+#
+# Bit-packed per-state table: ~2.5 MiB, ~ns O(1) lookups (the host default).
+map-fast = []
+# Baby-step giant-step discrete log: ~256 KiB, ~1 µs lookups (the middle ground).
+map-balanced = []
+# Pohlig–Hellman discrete log: a few dozen bytes, ~5 µs lookups (bare no_std).
+map-compact = []
 # WAV file loading helper (std only), used by tests and examples.
 wav = ["dep:hound", "std"]
 # Synthetic control-tone generator (ground-truth encoder). Enabled automatically
@@ -74,3 +87,8 @@ required-features = ["synth", "wav"]
 [[example]]
 name = "stress"
 required-features = ["synth", "wav"]
+
+[[example]]
+name = "bench_posmap"
+# Compares all three stores head to head.
+required-features = ["map-fast", "map-balanced", "map-compact"]
