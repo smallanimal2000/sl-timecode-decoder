@@ -22,14 +22,26 @@ near-perfect monotonic position tracking):
 | quadrature   | 90°, **right channel leads** on forward playback | same |
 | LFSR         | 20-bit, maximal-length | 20-bit, maximal-length |
 | taps         | `0x361e5` | `0x4f0d9` |
-| seed (origin)| `0x5e3e0` | `0x65b62` |
+| seed (origin)| `0xafd8e` | `0x9a9a2` |
+| lead-in      | ≥ ~4783 bits (~4.8 s) | ≥ ~6051 bits (~6.1 s) |
 
 The two sides use **different** LFSR polynomials so software can distinguish
-them. The `seed` is the LFSR state at the **first carrier cycle of the pressed
-tone**, so `position 0` = start of the groove timecode. Seeds were calibrated
-from start-to-end recordings by `examples/calibrate.rs` (detect onset → find a
-clean LFSR anchor → step the register back to the onset cycle), accurate to
-~±1 bit.
+them. The `seed` is the LFSR state at the **first clean program-timecode bit** of
+the `serato-cv02-side-?-start.wav` recordings — which begin right after the
+lead-in groove — so `position 0` = start of the program. Those recordings open
+with a needle-landing transient / lead-in tone (a near-constant AM pattern, not
+LFSR), so `examples/calibrate.rs` anchors the origin at the first bit where the
+program LFSR becomes self-consistent, rather than stepping the register back
+through the noisy landing (which could add or drop carrier cycles and misplace
+the origin).
+
+The CV also carries timecode in its **lead-in groove**, which physically
+precedes the program. The decoder reports the lead-in as **negative** positions:
+each side's `lead_in_bits` marks the top of the LFSR cycle, so a needle drop in
+the lead-in decodes around `−4783` / `−6051` and climbs continuously through `0`
+into the program. The lead-in length was measured against the full-side
+references `serato-cv02-side-?.wav`, whose needle-drop onset lands in the lead-in
+(the program itself reaches ≈ +807k / +913k, far below the fold threshold).
 
 ## How it works
 
@@ -121,8 +133,10 @@ cargo run --example analyze --features "analysis wav synth" -- recording.wav
 # locks/tracks on the recording:
 cargo run --example confirm --features "analysis wav synth" -- side.wav [skip_s] [take_s]
 
-# Calibrate the absolute-position origin (seed) from a start-to-end recording:
-cargo run --example calibrate --features "analysis wav synth" -- side-a.wav side-b.wav
+# Calibrate the program origin (seed) and lead-in length. With no args it uses
+# the four repo recordings (per side: a -start file for the origin + the full
+# file as a lead-in reference); or pass `start.wav ref.wav` pairs:
+cargo run --example calibrate --features "analysis wav synth"
 
 # Auto-detect which side (A/B) a recording is, from the audio alone (no filename):
 cargo run --release --example detect --features wav -- side.wav
@@ -192,10 +206,12 @@ SL_TC_WAV=/path/to/tone.wav cargo test --features "synth wav" -- --ignored
 
 * **Parameters confirmed** against real Serato CV02 recordings (both sides);
   `serato_cv02_side_a()` / `serato_cv02_side_b()` carry `confirmed: true`. The
-  absolute-position **origin** is calibrated to the start of the pressed tone
-  (position 0 ≈ groove start, ±1 bit).
+  absolute-position **origin** is calibrated to the start of the program groove
+  (position 0 ≈ start of the main timecode, right after the lead-in, ±1 bit).
 * **Absolute position.** Reported modulo the LFSR period (2²⁰−1 bits ≈ 17.5 min
-  at 1×), exact and continuous within a side, with 0 at the groove start.
+  at 1×), exact and continuous within a side, with 0 at the program start. The
+  coded **lead-in groove** reads as **negative** positions (down to ≈ `−4783` /
+  `−6051` on sides A/B) and joins the program continuously at 0.
 * **Signal-presence gating.** The decoder won't lock on noise-floor input (e.g. a
   record's pre-onset lead-in); lock requires the carrier above `min_signal`
   (default ≈ −40 dBFS, tunable via `Decoder::set_min_signal`) plus a short warmup.

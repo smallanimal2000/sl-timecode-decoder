@@ -20,8 +20,10 @@ All of these were **derived from real recordings** (`serato-cv02-side-a.wav`,
 | position code | **20-bit maximal-length LFSR** | Berlekamp–Massey |
 | taps side A | `0x361e5` | BM, modal over 93% of windows |
 | taps side B | `0x4f0d9` | BM, modal over 97% of windows |
-| seed side A | `0x5e3e0` (pos 0 = start of pressed tone) | `calibrate` |
-| seed side B | `0x65b62` | `calibrate` |
+| seed side A | `0xafd8e` (pos 0 = first clean program bit, after lead-in) | `calibrate` (`-start`, anchored past landing) |
+| seed side B | `0x9a9a2` | `calibrate` (`-start`, anchored past landing) |
+| lead-in side A | ≥ ~4783 bits (~4.8 s) coded groove before program → negative pos | `calibrate` (full ref) |
+| lead-in side B | ≥ ~6051 bits (~6.1 s) | `calibrate` (full ref) |
 | period | 2²⁰−1 = 1,048,575 bits ≈ **17.48 min** at 1× | — |
 
 **Surprises worth remembering:**
@@ -33,10 +35,21 @@ All of these were **derived from real recordings** (`serato-cv02-side-a.wav`,
   presumably so software can tell side A from side B. So parameters are
   **per-side**, not one global set. Don't assume symmetry.
 - **The recordings are full playthroughs that then hit a locked/skipping groove.**
-  Side A reaches ~688k bits (~11.5 min) then repeats one ~1.2 s revolution for
-  ~25 min; side B climbs to ~1,047,800 bits (16.6 min, *775 short of the wrap*)
-  then playback ends. **Neither crosses the LFSR wrap**, so wrap continuity is
-  only verifiable synthetically (`crosses_lfsr_wrap_continuously`).
+  Side A reaches ~+807k bits then repeats one ~1.2 s revolution for ~25 min; side B
+  climbs to ~+913k bits then playback ends. **Neither crosses the LFSR wrap**, so
+  wrap continuity is only verifiable synthetically (`crosses_lfsr_wrap_continuously`).
+  (Bit counts are under the current program origin; earlier notes used a lead-in
+  origin and read differently.)
+- **The CV has a coded LEAD-IN groove, and it's the same continuous LFSR.** The
+  program timecode extends backwards into the lead-in, so a needle drop there
+  decodes to real (earlier) LFSR positions — the decoder reports them as
+  **negative** (`lead_in_bits` folds the top of the cycle). Origin (position 0) is
+  the *first clean program bit* of the `-start` recordings. Watch out: those
+  recordings open with a needle-landing transient — a near-constant AM tone (~4%
+  bit-transition rate vs ~50% for LFSR) lasting ~90 bits — so **don't step the
+  register back to "bit 0"** through it; anchor on the first self-consistent LFSR
+  bit instead. The full-side references land deeper in the lead-in and confirm the
+  negative positions climb continuously through 0 into the program.
 
 ---
 

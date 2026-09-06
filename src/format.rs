@@ -47,6 +47,15 @@ pub struct TimecodeFormat {
     pub amp_low: f32,
     /// Which channel leads during forward playback.
     pub lead: LeadChannel,
+    /// Length, in bits (carrier cycles), of the coded **lead-in groove** that
+    /// precedes the program origin (`seed` / position 0). The lead-in carries the
+    /// same LFSR timecode but physically comes *before* the program, so the
+    /// decoder reports it as **negative** positions: any resolved LFSR state whose
+    /// raw cyclic index falls in the top `lead_in_bits` of the sequence (i.e.
+    /// `>= 2^bits - 1 - lead_in_bits`) is reported as `raw - period`, placing the
+    /// lead-in in `[-lead_in_bits, 0)`. Set to `0` for formats with no coded
+    /// lead-in (or when it hasn't been measured), disabling the fold.
+    pub lead_in_bits: u32,
     /// `true` if the parameters are confirmed against a real recording; `false`
     /// while still a provisional working model.
     pub confirmed: bool,
@@ -84,19 +93,34 @@ fn serato_amps() -> (f32, f32) {
 ///
 /// The two sides use **different** LFSR polynomials (so software can tell them
 /// apart) — see [`serato_cv02_side_b`]. `seed` is the register state at the first
-/// carrier cycle of the pressed tone, so **position 0 = start of the groove
-/// timecode** (calibrated from `serato-cv02-side-a.wav` via
-/// `examples/calibrate.rs`, accurate to ~±1 bit).
+/// **clean program-LFSR bit** of `serato-cv02-side-a-start.wav` (a recording that
+/// begins right after the lead-in groove), so **position 0 = start of the program
+/// groove**. The recording opens with a needle-landing transient / lead-in tone
+/// (a near-constant AM pattern, not LFSR), so calibration anchors the origin at
+/// the first bit where the program LFSR becomes self-consistent — rather than
+/// stepping the register back through the noisy landing, which could miscount
+/// carrier cycles. See `examples/calibrate.rs`.
+///
+/// Note: the CV carries timecode *before* this origin too, in the **lead-in
+/// groove**; the decoder reports it as **negative** positions (see
+/// [`TimecodeFormat::lead_in_bits`]). Earlier origins (`0x5e3e0`, then `0x2ebb`)
+/// were derived from a needle-drop onset / the noisy first bit and are superseded.
 pub fn serato_cv02_side_a() -> TimecodeFormat {
     let (amp_high, amp_low) = serato_amps();
     TimecodeFormat {
         name: "Serato CV02 side A (measured)",
         carrier_hz: 1000.0,
         lfsr: Lfsr::new(20, 0x361e5),
-        seed: 0x5e3e0,
+        seed: 0xafd8e,
         amp_high,
         amp_low,
         lead: LeadChannel::Right,
+        // Lead-in decodes as negative positions down to ≈ −4783 (deepest lock in
+        // `serato-cv02-side-a.wav`, whose needle-drop lands in the lead-in); a
+        // small margin puts the fold threshold just deeper. The program runs to
+        // ≈ +807k, ~236k bits below the threshold (period−4875), so no program
+        // position is ever folded.
+        lead_in_bits: 4875,
         confirmed: true,
     }
 }
@@ -105,18 +129,25 @@ pub fn serato_cv02_side_a() -> TimecodeFormat {
 ///
 /// Same carrier/quadrature/geometry as [`serato_cv02_side_a`] but a distinct
 /// 20-bit maximal-length LFSR, taps `0x4f0d9` (recovered from
-/// `serato-cv02-side-b.wav`; modal across 97% of windows). `seed` is calibrated
-/// so position 0 is the start of side B's groove timecode.
+/// `serato-cv02-side-b.wav`; modal across 97% of windows). `seed` is the state at
+/// the first clean program-LFSR bit of `serato-cv02-side-b-start.wav` (position 0
+/// = start of the program groove, after the lead-in), calibrated the same way as
+/// side A (anchored past the needle-landing transient). See `examples/calibrate.rs`.
 pub fn serato_cv02_side_b() -> TimecodeFormat {
     let (amp_high, amp_low) = serato_amps();
     TimecodeFormat {
         name: "Serato CV02 side B (measured)",
         carrier_hz: 1000.0,
         lfsr: Lfsr::new(20, 0x4f0d9),
-        seed: 0x65b62,
+        seed: 0x9a9a2,
         amp_high,
         amp_low,
         lead: LeadChannel::Right,
+        // Lead-in decodes as negative positions down to ≈ −6051 (deepest lock in
+        // `serato-cv02-side-b.wav`); a small margin puts the fold threshold just
+        // deeper. The program runs to ≈ +913k, then a ~129k-bit unused gap
+        // precedes the lead-in start (period−6175) — no program position is folded.
+        lead_in_bits: 6175,
         confirmed: true,
     }
 }

@@ -88,6 +88,7 @@ fn main() {
         amp_high: base.amp_high,
         amp_low: base.amp_low,
         lead,
+        lead_in_bits: 0, // unknown for an ad-hoc measured segment; no fold
         confirmed: true,
     };
     let mut dec = Decoder::new(fmt, sr);

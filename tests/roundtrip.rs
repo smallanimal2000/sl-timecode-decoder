@@ -148,8 +148,16 @@ fn crosses_lfsr_wrap_continuously() {
     // Real recordings end before the LFSR period wraps (~17.5 min), so exercise
     // the wrap synthetically: start a few thousand bits before the end of the
     // period and play forward across it.
+    //
+    // For a side with a coded lead-in, the raw LFSR wrap (state `period-1 -> 0`)
+    // coincides with the program origin: the decoder folds the top `lead_in_bits`
+    // to negative, so what would be a `period-1 -> 0` jump is reported as the
+    // continuous signed crossing `-1 -> 0`. Starting at `period - 3000` therefore
+    // begins ~3000 bits into the (negative) lead-in and climbs monotonically
+    // through 0 into the program.
     let fmt = serato_cv02();
     let period: i64 = (1 << fmt.lfsr.bits) - 1;
+    assert!(fmt.lead_in_bits >= 3000, "test assumes the wrap falls in the lead-in fold");
     let start = (period - 3000) as f64;
     let (buf, truth) = render_const(start, 1.0, 220_000);
     let states = decode_with_truth(&buf, &truth);
@@ -157,20 +165,24 @@ fn crosses_lfsr_wrap_continuously() {
     let locked: Vec<_> = states.iter().filter(|(s, _)| s.locked).map(|(s, _)| s).collect();
     assert!(locked.len() > 2000, "locked={}", locked.len());
 
-    let mut wraps = 0usize;
+    let mut crossings = 0usize; // signed lead-in -> program transitions (the wrap)
+    let mut saw_negative = false;
     let mut discontinuities = 0usize;
     for w in locked.windows(2) {
         let (a, b) = (w[0].position_bits as i64, w[1].position_bits as i64);
-        let step = ((b - a) % period + period) % period;
-        let is_wrap = a > period * 9 / 10 && b < period / 10;
-        if is_wrap {
-            wraps += 1;
+        saw_negative |= a < 0;
+        // Forward step is +1 everywhere, including across the signed origin
+        // (`-1 -> 0`); occasional repeats (0) are allowed.
+        let step = b - a;
+        if a < 0 && b >= 0 {
+            crossings += 1;
         }
         if step != 1 && step != 0 {
             discontinuities += 1;
         }
     }
-    assert!(wraps >= 1, "never crossed the wrap");
+    assert!(saw_negative, "never saw the negative lead-in region");
+    assert!(crossings >= 1, "never crossed the wrap (lead-in -> program origin)");
     assert_eq!(discontinuities, 0, "position discontinuities across wrap");
 }
 

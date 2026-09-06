@@ -129,6 +129,9 @@ const SIDE_SWITCH_MARGIN: f32 = 0.1;
 struct SideTrack {
     side: Side,
     map: PositionMap,
+    /// Coded lead-in length (bits) for this side; drives the negative-position
+    /// fold (see [`fold_signed`]).
+    lead_in_bits: i64,
     last_pos: Option<i64>,
     lock_count: u32,
     disagree_count: u32,
@@ -142,6 +145,7 @@ impl SideTrack {
         SideTrack {
             side,
             map: PositionMap::build(fmt.lfsr, fmt.seed),
+            lead_in_bits: fmt.lead_in_bits as i64,
             last_pos: None,
             lock_count: 0,
             disagree_count: 0,
@@ -275,6 +279,13 @@ impl Decoder {
         self.selected.map(|i| self.tracks[i].side)
     }
 
+    /// Coded lead-in length (bits) of the currently latched side, or `0` if none
+    /// is latched. Drives the negative-position fold for reported positions.
+    #[inline]
+    fn sel_lead_in(&self) -> i64 {
+        self.selected.map(|i| self.tracks[i].lead_in_bits).unwrap_or(0)
+    }
+
     #[inline]
     fn wrap_f(&self, v: f64) -> f64 {
         let p = self.period as f64;
@@ -384,7 +395,7 @@ impl Decoder {
                 locked: false,
                 confidence: ev.confidence,
                 signal: ev.signal,
-                fine_position: self.fine_pos,
+                fine_position: fold_signed_f(self.fine_pos, self.period as f64, self.sel_lead_in() as f64),
                 sample: ev.sample,
             });
         }
@@ -458,20 +469,25 @@ impl Decoder {
             }
         }
 
-        // Authoritative output comes from the latched side (if any).
-        let (pos, side, locked) = match self.selected {
+        // Authoritative output comes from the latched side (if any). Positions are
+        // folded to signed here so the coded lead-in reads negative (see
+        // `fold_signed`); the tracker's `last_pos` stays cyclic internally.
+        let (raw_pos, pos, side, locked, lead_in) = match self.selected {
             Some(i) => {
                 let t = &self.tracks[i];
                 let locked = warmed && t.lock_count >= self.cfg.lock_threshold;
-                (t.last_pos, Some(t.side), locked)
+                let signed = t.last_pos.map(|p| fold_signed(p, period, t.lead_in_bits));
+                (t.last_pos, signed, Some(t.side), locked, t.lead_in_bits)
             }
-            None => (None, None, false),
+            None => (None, None, None, false, 0),
         };
 
         // Re-anchor the sub-bit interpolator to each locked cycle so it stays
-        // exact and drift is bounded to a single bit between events.
+        // exact and drift is bounded to a single bit between events. The anchor is
+        // kept in RAW cyclic space (the fold is applied only when reporting) so the
+        // phase extrapolation and `wrap_f` stay continuous across the LFSR wrap.
         if locked {
-            if let Some(p) = pos {
+            if let Some(p) = raw_pos {
                 self.anchor_pos = p;
                 self.anchor_phase = self.frontend.phase_total();
                 self.have_anchor = true;
@@ -480,6 +496,7 @@ impl Decoder {
         }
 
         let position_bits = pos.map(|p| p as f64).unwrap_or(f64::NAN);
+        let fine_raw = if locked { raw_pos.map(|p| p as f64).unwrap_or(self.fine_pos) } else { self.fine_pos };
         Some(DecodeState {
             position_bits,
             position_seconds: pos
@@ -491,7 +508,7 @@ impl Decoder {
             locked,
             confidence: ev.confidence,
             signal: ev.signal,
-            fine_position: if locked { position_bits } else { self.fine_pos },
+            fine_position: fold_signed_f(fine_raw, period as f64, lead_in as f64),
             sample: ev.sample,
         })
     }
@@ -513,6 +530,33 @@ impl Decoder {
 #[inline]
 fn wrap_i(v: i64, period: i64) -> i64 {
     ((v % period) + period) % period
+}
+
+/// Map a raw cyclic position `[0, period)` to a signed position, reporting the
+/// coded **lead-in groove** (the top `lead_in_bits` of the LFSR cycle, which
+/// physically precedes the program) as negative: `raw - period` when
+/// `raw >= period - lead_in_bits`. With `lead_in_bits == 0` this is a no-op.
+///
+/// This is presentation-only — the trackers keep positions cyclic in `[0, period)`
+/// so continuity/agreement math still works across the wrap; the sign is applied
+/// when a position is handed out.
+#[inline]
+fn fold_signed(raw: i64, period: i64, lead_in_bits: i64) -> i64 {
+    if lead_in_bits > 0 && raw >= period - lead_in_bits {
+        raw - period
+    } else {
+        raw
+    }
+}
+
+/// Float counterpart of [`fold_signed`] for the sub-bit `fine_position`.
+#[inline]
+fn fold_signed_f(raw: f64, period: f64, lead_in_bits: f64) -> f64 {
+    if lead_in_bits > 0.0 && raw >= period - lead_in_bits {
+        raw - period
+    } else {
+        raw
+    }
 }
 
 #[cfg(test)]
